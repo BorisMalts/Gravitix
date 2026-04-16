@@ -1,0 +1,198 @@
+// ════════════════════════════════════════════════════════════════
+//  todo_bot.grav — To-Do бот: полноценный пример возможностей Gravitix
+//  Демонстрирует: state, flow, guard, |> pipe, match/regex, every
+// ════════════════════════════════════════════════════════════════
+
+state {
+    todos:    map<int, list> = {},   // user_id -> list<str>
+    done:     map<int, int>  = {},   // user_id -> count of completed
+}
+
+// ── Вспомогательные функции ───────────────────────────────────────
+
+fn get_user_todos(user_id: int) -> list {
+    if state.todos.has(user_id) {
+        return state.todos[user_id];
+    }
+    let empty = [];
+    state.todos[user_id] = empty;
+    return empty;
+}
+
+fn format_todos(todos: list) -> str {
+    if len(todos) == 0 {
+        return "Список пуст 🎉";
+    }
+    let lines = [];
+    let i = 0;
+    for item in todos {
+        i += 1;
+        push(lines, "{i}. {item}");
+    }
+    return join(lines, "\n");
+}
+
+// ── /start ───────────────────────────────────────────────────────
+on /start {
+    emit "📋 <b>To-Do Bot</b>";
+    emit """Команды:
+/add — добавить задачу
+/list — показать список
+/done N — отметить задачу N выполненной
+/clear — очистить список
+/stats — статистика""";
+}
+
+// ── /list ────────────────────────────────────────────────────────
+on /list {
+    let todos = get_user_todos(ctx.user_id);
+    let text  = format_todos(todos);
+    emit "📋 Твои задачи:\n{text}";
+}
+
+// ── /add ─────────────────────────────────────────────────────────
+on /add {
+    run flow add_todo;
+}
+
+flow add_todo {
+    emit "Введи задачу:";
+    let task = wait msg;
+    let task = task |> trim |> sanitize;
+
+    if len(task) == 0 {
+        emit "Пустая задача не принята.";
+        return;
+    }
+
+    let todos = get_user_todos(ctx.user_id);
+    push(todos, task);
+    state.todos[ctx.user_id] = todos;
+
+    let n = len(todos);
+    emit "✅ Добавлено: «{task}» (задача #{n})";
+}
+
+// ── /done ────────────────────────────────────────────────────────
+on /done {
+    run flow mark_done;
+}
+
+flow mark_done {
+    let todos = get_user_todos(ctx.user_id);
+    if len(todos) == 0 {
+        emit "Список пуст, нечего отмечать.";
+        return;
+    }
+
+    emit "📋 Твои задачи:\n{format_todos(todos)}";
+    emit "Введи номер выполненной задачи:";
+    let num_str = wait msg;
+    let num = int(num_str);
+
+    if num < 1 || num > len(todos) {
+        emit "Неверный номер. Попробуй /done снова.";
+        return;
+    }
+
+    // Build new list without the completed item
+    let removed = todos[num - 1];
+    let new_todos = [];
+    let i = 0;
+    for item in todos {
+        i += 1;
+        if i != num {
+            push(new_todos, item);
+        }
+    }
+    state.todos[ctx.user_id] = new_todos;
+
+    // Increment done counter
+    let prev = 0;
+    if state.done.has(ctx.user_id) {
+        prev = state.done[ctx.user_id];
+    }
+    state.done[ctx.user_id] = prev + 1;
+
+    emit "🎉 Выполнено: «{removed}»";
+    let remaining = len(new_todos);
+    if remaining > 0 {
+        emit "Осталось задач: {remaining}";
+    } else {
+        emit "Все задачи выполнены! 🥳";
+    }
+}
+
+// ── /clear ───────────────────────────────────────────────────────
+on /clear {
+    run flow confirm_clear;
+}
+
+flow confirm_clear {
+    let todos = get_user_todos(ctx.user_id);
+    if len(todos) == 0 {
+        emit "Список уже пуст.";
+        return;
+    }
+
+    emit "Очистить все {len(todos)} задач? Введи «да» для подтверждения:";
+    let answer = wait msg;
+    let answer = answer |> trim |> lowercase;
+
+    if answer == "да" || answer == "yes" {
+        state.todos[ctx.user_id] = [];
+        emit "🗑 Список очищен.";
+    } else {
+        emit "Отменено.";
+    }
+}
+
+// ── /stats ───────────────────────────────────────────────────────
+on /stats {
+    let todos = get_user_todos(ctx.user_id);
+    let active    = len(todos);
+    let completed = 0;
+    if state.done.has(ctx.user_id) {
+        completed = state.done[ctx.user_id];
+    }
+    let total = active + completed;
+
+    emit """📊 Твоя статистика:
+• Активных задач: {active}
+• Выполнено всего: {completed}
+• Всего создано: {total}""";
+}
+
+// ── Поиск задач по тексту ─────────────────────────────────────────
+on msg {
+    match ctx.text {
+        /^поиск (.+)/i => {
+            let query = ctx.text;
+            let todos = get_user_todos(ctx.user_id);
+            let found = [];
+            let i = 0;
+            for item in todos {
+                i += 1;
+                if contains(lowercase(item), lowercase(query)) {
+                    push(found, "{i}. {item}");
+                }
+            }
+            if len(found) == 0 {
+                emit "Ничего не найдено по запросу «{query}»";
+            } else {
+                emit "🔍 Найдено:\n{join(found, \"\n\")}";
+            }
+        },
+        _ => emit "Используй команды или /start для справки.",
+    }
+}
+
+// ── Еженедельное напоминание ──────────────────────────────────────
+every 7 days {
+    for user_id in state.todos.keys() {
+        let todos = state.todos[user_id];
+        if len(todos) > 0 {
+            emit_to(user_id, "⏰ Напоминание: у тебя {len(todos)} незавершённых задач!");
+        }
+    }
+}

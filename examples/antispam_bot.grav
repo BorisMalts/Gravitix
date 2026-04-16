@@ -1,0 +1,901 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  antispam_bot.grav — Combot-уровня антиспам для Vortex
+//  Запуск: gravitix run antispam_bot.grav --token BOT_TOKEN
+//
+//  Возможности:
+//   • Flood detection (N сообщений за T секунд)
+//   • Repeat detection (одинаковые сообщения подряд)
+//   • Link/URL spam detection
+//   • ALL CAPS detection
+//   • Спам-паттерны (regex blacklist)
+//   • Стоп-слова (кастомный список)
+//   • Новые участники: captcha-верификация
+//   • Система предупреждений с эскалацией (warn → mute → kick → ban)
+//   • Whitelist доверенных пользователей
+//   • Ночной режим (slow mode по расписанию)
+//   • Anti-raid (массовый join detection)
+//   • Статистика, лог действий, дашборд
+//   • Полная настройка через команды
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Состояние бота ──────────────────────────────────────────────────────────
+
+state {
+    // Конфигурация (дефолты можно менять через /config)
+    config: map<str, int> = {
+        "flood_limit":       10,     // макс сообщений
+        "flood_window":      10,     // за N секунд
+        "repeat_limit":      3,      // одинаковых сообщений
+        "repeat_window":     30,     // за N секунд
+        "link_limit":        3,      // сообщений со ссылками
+        "link_window":       60,     // за N секунд
+        "caps_min_len":      20,     // мин символов для проверки CAPS
+        "caps_ratio":        80,     // % заглавных букв
+        "warn_before_mute":  3,      // предупреждений до мута
+        "mute_before_kick":  2,      // мутов до кика
+        "kick_before_ban":   2,      // киков до бана
+        "mute_duration":     300,    // мут в секундах (5 мин)
+        "newcomer_timeout":  300,    // время на captcha (5 мин)
+        "raid_joins":        10,     // джойнов за
+        "raid_window":       60,     // секунд = raid
+        "raid_slow_mode":    30,     // slow mode при рейде (сек)
+        "night_start":       23,     // начало ночного режима (час UTC)
+        "night_end":         7,      // конец ночного режима
+        "night_slow_mode":   10,     // slow mode ночью (сек)
+        "max_msg_length":    4000,   // макс длина сообщения
+        "emoji_spam_limit":  50,     // макс эмодзи в сообщении
+    },
+
+    // Флаги (вкл/выкл модули)
+    modules: map<str, bool> = {
+        "flood":       true,
+        "repeat":      true,
+        "links":       true,
+        "caps":        true,
+        "patterns":    true,
+        "stopwords":   true,
+        "captcha":     true,
+        "raid":        true,
+        "night":       false,
+        "length":      true,
+        "emoji_spam":  true,
+        "forwards":    false,
+    },
+
+    // Кастомные стоп-слова (добавляются через /stopword add ...)
+    stopwords: list = [
+        "casino", "viagra", "cialis", "crypto airdrop", "free money",
+        "investment opportunity", "earn from home", "click here now",
+        "onlyfans", "порно", "казино", "ставки", "скидка 90%",
+    ],
+
+    // Regex паттерны спама
+    patterns: list = [
+        "https?://t\\.me/\\+",                      // telegram invite links
+        "bit\\.ly|goo\\.gl|tinyurl|short\\.link",   // URL shorteners
+        "\\b\\d{16}\\b",                             // credit card numbers
+        "(.)\\1{15,}",                               // char repeat >15x
+        "(?i)подпис|канал|переход|реклам.*чат",      // RU spam phrases
+        "(?i)free\\s+(bitcoin|crypto|nft|airdrop)",  // crypto scam
+        "(?i)(win|won|claim)\\s+\\$\\d+",            // fake prizes
+    ],
+
+    // Пользовательские whitelist (ID -> timestamp добавления)
+    whitelist: map<int, int> = {},
+
+    // Трекер сообщений: user_key -> list<{ts, hash}>
+    msg_tracker: map<str, list> = {},
+
+    // Трекер ссылок: user_key -> list<ts>
+    link_tracker: map<str, list> = {},
+
+    // Предупреждения: user_id -> {warns, mutes, kicks, last_action_ts}
+    user_strikes: map<int, map> = {},
+
+    // Captcha: user_id -> {answer, expires, room_id}
+    captcha_pending: map<int, map> = {},
+
+    // Raid tracker: room_id -> list<join_ts>
+    raid_tracker: map<int, list> = {},
+
+    // Лог последних действий
+    action_log: list = [],
+
+    // Глобальная статистика
+    stats: map<str, int> = {
+        "messages_scanned": 0,
+        "spam_blocked":     0,
+        "warns_issued":     0,
+        "mutes_issued":     0,
+        "kicks_issued":     0,
+        "bans_issued":      0,
+        "captchas_sent":    0,
+        "captchas_passed":  0,
+        "raids_detected":   0,
+    },
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Вспомогательные функции
+// ════════════════════════════════════════════════════════════════════════════
+
+fn is_admin(user_id: int) -> bool {
+    return check_permission(user_id, "admin") || check_permission(user_id, "owner");
+}
+
+fn is_whitelisted(user_id: int) -> bool {
+    return has(state.whitelist, str(user_id));
+}
+
+fn user_key(room_id: int, user_id: int) -> str {
+    return "{room_id}:{user_id}";
+}
+
+fn ts() -> int {
+    return now();
+}
+
+fn hash_text(text: str) -> str {
+    return sha256(lowercase(trim(text)));
+}
+
+fn count_uppercase(text: str) -> int {
+    let upper = 0;
+    let total = 0;
+    let chars = split(text, "");
+    for c in chars {
+        if regex_match(c, "[A-ZА-ЯЁ]", "") {
+            upper += 1;
+            total += 1;
+        } elif regex_match(c, "[a-zа-яё]", "") {
+            total += 1;
+        }
+    }
+    if total == 0 { return 0; }
+    return (upper * 100) / total;
+}
+
+fn count_emoji(text: str) -> int {
+    // Подсчёт unicode эмодзи
+    let parts = regex_split(text, "[\\x{1F600}-\\x{1F64F}\\x{1F300}-\\x{1F5FF}\\x{1F680}-\\x{1F6FF}\\x{2600}-\\x{26FF}\\x{2700}-\\x{27BF}]", "");
+    let total_len = len(text);
+    let parts_len = 0;
+    for p in parts {
+        parts_len += len(p);
+    }
+    return total_len - parts_len;
+}
+
+fn log_action(action: str, user_id: int, room_id: int, detail: str) {
+    let entry = {
+        "ts": ts(),
+        "action": action,
+        "user_id": user_id,
+        "room_id": room_id,
+        "detail": detail,
+    };
+    push(state.action_log, entry);
+    // Ротация: храним последние 500 записей
+    if len(state.action_log) > 500 {
+        state.action_log = slice(state.action_log, len(state.action_log) - 500, len(state.action_log));
+    }
+}
+
+fn get_strikes(user_id: int) -> map {
+    if has(state.user_strikes, str(user_id)) {
+        return state.user_strikes[user_id];
+    }
+    let fresh = { "warns": 0, "mutes": 0, "kicks": 0, "last_ts": 0 };
+    state.user_strikes[user_id] = fresh;
+    return fresh;
+}
+
+fn set_strikes(user_id: int, strikes: map) {
+    state.user_strikes[user_id] = strikes;
+}
+
+/// Эскалация наказания: warn → mute → kick → ban
+fn escalate(room_id: int, user_id: int, reason: str) {
+    let s = get_strikes(user_id);
+    let cfg = state.config;
+
+    s["warns"] = s["warns"] + 1;
+    s["last_ts"] = ts();
+
+    if s["warns"] >= cfg["warn_before_mute"] + cfg["mute_before_kick"] + cfg["kick_before_ban"] {
+        // ── BAN ──
+        vortex_ban(room_id, user_id, reason);
+        state.stats["bans_issued"] = state.stats["bans_issued"] + 1;
+        log_action("ban", user_id, room_id, reason);
+        emit "🚫 @{ctx.username} забанен: {reason}";
+    } elif s["warns"] >= cfg["warn_before_mute"] + cfg["mute_before_kick"] {
+        // ── KICK ──
+        s["kicks"] = s["kicks"] + 1;
+        vortex_kick(room_id, user_id);
+        state.stats["kicks_issued"] = state.stats["kicks_issued"] + 1;
+        log_action("kick", user_id, room_id, reason);
+        emit "👢 @{ctx.username} кикнут: {reason}";
+    } elif s["warns"] >= cfg["warn_before_mute"] {
+        // ── MUTE ──
+        s["mutes"] = s["mutes"] + 1;
+        let dur = cfg["mute_duration"];
+        vortex_mute(room_id, user_id, dur);
+        state.stats["mutes_issued"] = state.stats["mutes_issued"] + 1;
+        log_action("mute", user_id, room_id, "{reason} ({dur}s)");
+        emit "🔇 @{ctx.username} замучен на {dur}с: {reason}";
+    } else {
+        // ── WARN ──
+        let left = cfg["warn_before_mute"] - s["warns"];
+        vortex_warn(room_id, user_id, reason);
+        state.stats["warns_issued"] = state.stats["warns_issued"] + 1;
+        log_action("warn", user_id, room_id, reason);
+        emit "⚠️ @{ctx.username}: {reason} (предупреждение {s[\"warns\"]}/{cfg[\"warn_before_mute\"]})";
+    }
+    set_strikes(user_id, s);
+    state.stats["spam_blocked"] = state.stats["spam_blocked"] + 1;
+}
+
+/// Очистка устаревших записей в трекере
+fn cleanup_tracker(key: str, window_sec: int) {
+    if !has(state.msg_tracker, key) { return; }
+    let entries = state.msg_tracker[key];
+    let cutoff = ts() - window_sec;
+    let fresh = [];
+    for e in entries {
+        if e["ts"] > cutoff {
+            push(fresh, e);
+        }
+    }
+    state.msg_tracker[key] = fresh;
+}
+
+fn cleanup_link_tracker(key: str, window_sec: int) {
+    if !has(state.link_tracker, key) { return; }
+    let entries = state.link_tracker[key];
+    let cutoff = ts() - window_sec;
+    let fresh = [];
+    for t in entries {
+        if t > cutoff {
+            push(fresh, t);
+        }
+    }
+    state.link_tracker[key] = fresh;
+}
+
+/// Генерация captcha
+fn make_captcha() -> map {
+    let a = int(now() % 9) + 1;
+    let b = int((now() / 7) % 9) + 1;
+    let result = a + b;
+    return { "question": "{a} + {b}", "answer": str(result) };
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Детекторы спама
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 1. Flood detector — слишком много сообщений за окно
+fn check_flood(room_id: int, user_id: int) -> bool {
+    if !state.modules["flood"] { return false; }
+    let key = user_key(room_id, user_id);
+    let cfg = state.config;
+    cleanup_tracker(key, cfg["flood_window"]);
+
+    if !has(state.msg_tracker, key) {
+        state.msg_tracker[key] = [];
+    }
+    let entries = state.msg_tracker[key];
+    push(entries, { "ts": ts(), "hash": "" });
+    state.msg_tracker[key] = entries;
+
+    return len(entries) > cfg["flood_limit"];
+}
+
+/// 2. Repeat detector — одинаковые сообщения подряд
+fn check_repeat(room_id: int, user_id: int, text: str) -> bool {
+    if !state.modules["repeat"] { return false; }
+    let key = "rep:{room_id}:{user_id}";
+    let cfg = state.config;
+    let h = hash_text(text);
+    let cutoff = ts() - cfg["repeat_window"];
+
+    if !has(state.msg_tracker, key) {
+        state.msg_tracker[key] = [];
+    }
+    let entries = state.msg_tracker[key];
+    // Очистка старых
+    let fresh = [];
+    for e in entries {
+        if e["ts"] > cutoff {
+            push(fresh, e);
+        }
+    }
+    push(fresh, { "ts": ts(), "hash": h });
+    state.msg_tracker[key] = fresh;
+
+    // Подсчитываем одинаковые хэши
+    let same = 0;
+    for e in fresh {
+        if e["hash"] == h {
+            same += 1;
+        }
+    }
+    return same >= cfg["repeat_limit"];
+}
+
+/// 3. Link spam detector
+fn check_links(room_id: int, user_id: int, text: str) -> bool {
+    if !state.modules["links"] { return false; }
+    let has_link = regex_match(text, "https?://\\S+|www\\.\\S+", "i");
+    if !has_link { return false; }
+
+    let key = user_key(room_id, user_id);
+    let cfg = state.config;
+    cleanup_link_tracker(key, cfg["link_window"]);
+
+    if !has(state.link_tracker, key) {
+        state.link_tracker[key] = [];
+    }
+    let entries = state.link_tracker[key];
+    push(entries, ts());
+    state.link_tracker[key] = entries;
+
+    return len(entries) > cfg["link_limit"];
+}
+
+/// 4. CAPS detector
+fn check_caps(text: str) -> bool {
+    if !state.modules["caps"] { return false; }
+    let cfg = state.config;
+    // Только буквы (без пробелов, цифр, спецсимволов)
+    let alpha_only = regex_replace(text, "[^a-zA-Zа-яА-ЯёЁ]", "", "g");
+    if len(alpha_only) < cfg["caps_min_len"] { return false; }
+    let ratio = count_uppercase(alpha_only);
+    return ratio >= cfg["caps_ratio"];
+}
+
+/// 5. Spam patterns (regex blacklist)
+fn check_patterns(text: str) -> bool {
+    if !state.modules["patterns"] { return false; }
+    for pat in state.patterns {
+        if regex_match(text, pat, "i") {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// 6. Стоп-слова
+fn check_stopwords(text: str) -> bool {
+    if !state.modules["stopwords"] { return false; }
+    let lower = lowercase(text);
+    for word in state.stopwords {
+        if index_of(lower, lowercase(word)) >= 0 {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// 7. Длина сообщения
+fn check_length(text: str) -> bool {
+    if !state.modules["length"] { return false; }
+    return len(text) > state.config["max_msg_length"];
+}
+
+/// 8. Emoji spam
+fn check_emoji_spam(text: str) -> bool {
+    if !state.modules["emoji_spam"] { return false; }
+    let count = count_emoji(text);
+    return count > state.config["emoji_spam_limit"];
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Главный обработчик сообщений
+// ════════════════════════════════════════════════════════════════════════════
+
+on msg {
+    let text = ctx.text;
+    if text == null || len(trim(text)) == 0 { return; }
+
+    // Не трогаем админов и whitelist
+    if is_admin(ctx.user_id) || is_whitelisted(ctx.user_id) { return; }
+
+    // Captcha pending: если ожидается ответ — проверяем
+    if has(state.captcha_pending, str(ctx.user_id)) {
+        let cap = state.captcha_pending[ctx.user_id];
+        if cap["room_id"] == ctx.room_id {
+            if trim(text) == cap["answer"] {
+                // Прошёл captcha
+                del(state.captcha_pending, str(ctx.user_id));
+                state.stats["captchas_passed"] = state.stats["captchas_passed"] + 1;
+                delete_msg ctx.message_id;
+                emit "✅ @{ctx.username} верифицирован!";
+                return;
+            } else {
+                // Неверный ответ — удаляем сообщение, даём ещё попытку
+                delete_msg ctx.message_id;
+                return;
+            }
+        }
+    }
+
+    state.stats["messages_scanned"] = state.stats["messages_scanned"] + 1;
+
+    // ── Проверки (от быстрых к медленным) ──
+
+    // 1. Flood
+    if check_flood(ctx.room_id, ctx.user_id) {
+        delete_msg ctx.message_id;
+        escalate(ctx.room_id, ctx.user_id, "Flood ({state.config[\"flood_limit\"]} сообщений за {state.config[\"flood_window\"]}с)");
+        return;
+    }
+
+    // 2. Repeat
+    if check_repeat(ctx.room_id, ctx.user_id, text) {
+        delete_msg ctx.message_id;
+        escalate(ctx.room_id, ctx.user_id, "Повторяющиеся сообщения");
+        return;
+    }
+
+    // 3. Spam patterns
+    if check_patterns(text) {
+        delete_msg ctx.message_id;
+        escalate(ctx.room_id, ctx.user_id, "Спам-паттерн обнаружен");
+        return;
+    }
+
+    // 4. Стоп-слова
+    if check_stopwords(text) {
+        delete_msg ctx.message_id;
+        escalate(ctx.room_id, ctx.user_id, "Запрещённое содержимое");
+        return;
+    }
+
+    // 5. Link spam
+    if check_links(ctx.room_id, ctx.user_id, text) {
+        delete_msg ctx.message_id;
+        escalate(ctx.room_id, ctx.user_id, "Спам ссылками");
+        return;
+    }
+
+    // 6. ALL CAPS
+    if check_caps(text) {
+        delete_msg ctx.message_id;
+        escalate(ctx.room_id, ctx.user_id, "Сообщение полностью заглавными буквами");
+        return;
+    }
+
+    // 7. Длина
+    if check_length(text) {
+        delete_msg ctx.message_id;
+        escalate(ctx.room_id, ctx.user_id, "Слишком длинное сообщение ({len(text)} символов)");
+        return;
+    }
+
+    // 8. Emoji spam
+    if check_emoji_spam(text) {
+        delete_msg ctx.message_id;
+        escalate(ctx.room_id, ctx.user_id, "Слишком много эмодзи");
+        return;
+    }
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Обработка forward (пересылок) — часто используется для спама
+// ════════════════════════════════════════════════════════════════════════════
+
+on forward guard state.modules["forwards"] {
+    if is_admin(ctx.user_id) || is_whitelisted(ctx.user_id) { return; }
+    delete_msg ctx.message_id;
+    escalate(ctx.room_id, ctx.user_id, "Пересылки запрещены");
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Anti-raid: массовый вход участников
+// ════════════════════════════════════════════════════════════════════════════
+
+on join {
+    let cfg = state.config;
+
+    // ── Captcha для новых участников ──
+    if state.modules["captcha"] {
+        let cap = make_captcha();
+        state.captcha_pending[ctx.user_id] = {
+            "answer": cap["answer"],
+            "expires": ts() + cfg["newcomer_timeout"],
+            "room_id": ctx.room_id,
+        };
+        state.stats["captchas_sent"] = state.stats["captchas_sent"] + 1;
+        emit "👋 Добро пожаловать, @{ctx.username}! Для верификации решите: {cap[\"question\"]} = ?";
+    }
+
+    // ── Raid detection ──
+    if state.modules["raid"] {
+        let rid = ctx.room_id;
+        if !has(state.raid_tracker, str(rid)) {
+            state.raid_tracker[rid] = [];
+        }
+        let joins = state.raid_tracker[rid];
+        push(joins, ts());
+
+        // Очистка старых
+        let cutoff = ts() - cfg["raid_window"];
+        let fresh = [];
+        for t in joins {
+            if t > cutoff { push(fresh, t); }
+        }
+        state.raid_tracker[rid] = fresh;
+
+        if len(fresh) >= cfg["raid_joins"] {
+            state.stats["raids_detected"] = state.stats["raids_detected"] + 1;
+            log_action("raid", 0, rid, "{len(fresh)} джойнов за {cfg[\"raid_window\"]}с");
+            vortex_set_slow_mode(rid, cfg["raid_slow_mode"]);
+            emit "🚨 Обнаружена raid-атака! Включён slow mode {cfg[\"raid_slow_mode\"]}с.";
+        }
+    }
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Очистка captcha по таймауту (каждую минуту)
+// ════════════════════════════════════════════════════════════════════════════
+
+every 1 minutes {
+    let expired = [];
+    for uid in keys(state.captcha_pending) {
+        let cap = state.captcha_pending[uid];
+        if cap["expires"] < ts() {
+            push(expired, uid);
+        }
+    }
+    for uid in expired {
+        let cap = state.captcha_pending[uid];
+        del(state.captcha_pending, uid);
+        vortex_kick(cap["room_id"], int(uid));
+        log_action("kick_captcha", int(uid), cap["room_id"], "Captcha timeout");
+        vortex_send(cap["room_id"], "⏰ @user_{uid} не прошёл верификацию — удалён.");
+    }
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Ночной режим (по расписанию)
+// ════════════════════════════════════════════════════════════════════════════
+
+every 30 minutes {
+    if !state.modules["night"] { return; }
+    let cfg = state.config;
+    let hour = (now() / 3600) % 24;
+    let is_night = false;
+    if cfg["night_start"] > cfg["night_end"] {
+        is_night = hour >= cfg["night_start"] || hour < cfg["night_end"];
+    } else {
+        is_night = hour >= cfg["night_start"] && hour < cfg["night_end"];
+    }
+
+    // Применяем ко всем комнатам бота
+    let rooms = vortex_get_rooms();
+    for room in rooms {
+        if is_night {
+            vortex_set_slow_mode(room["id"], cfg["night_slow_mode"]);
+        } else {
+            vortex_set_slow_mode(room["id"], 0);
+        }
+    }
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Ежечасная ротация трекеров (чтобы не расти бесконечно)
+// ════════════════════════════════════════════════════════════════════════════
+
+every 1 hours {
+    let cutoff_msg = ts() - 120;   // 2 минуты
+    let cutoff_link = ts() - 120;
+
+    // Ротация msg_tracker
+    let fresh_mt = {};
+    for key in keys(state.msg_tracker) {
+        let entries = state.msg_tracker[key];
+        let alive = [];
+        for e in entries {
+            if e["ts"] > cutoff_msg {
+                push(alive, e);
+            }
+        }
+        if len(alive) > 0 {
+            fresh_mt[key] = alive;
+        }
+    }
+    state.msg_tracker = fresh_mt;
+
+    // Ротация link_tracker
+    let fresh_lt = {};
+    for key in keys(state.link_tracker) {
+        let entries = state.link_tracker[key];
+        let alive = [];
+        for t in entries {
+            if t > cutoff_link { push(alive, t); }
+        }
+        if len(alive) > 0 {
+            fresh_lt[key] = alive;
+        }
+    }
+    state.link_tracker = fresh_lt;
+
+    // Ротация raid_tracker
+    let fresh_rt = {};
+    for rid in keys(state.raid_tracker) {
+        let entries = state.raid_tracker[rid];
+        let alive = [];
+        for t in entries {
+            if t > cutoff_msg { push(alive, t); }
+        }
+        if len(alive) > 0 {
+            fresh_rt[rid] = alive;
+        }
+    }
+    state.raid_tracker = fresh_rt;
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Команды администратора
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Главное меню ──
+on /antispam guard is_admin(ctx.user_id) {
+    emit """🛡 <b>Vortex AntiSpam Bot</b>
+
+Команды:
+  /antispam_status   — статус и статистика
+  /antispam_config   — текущие настройки
+  /antispam_log      — последние действия
+  /antispam_reset    — сбросить страйки пользователя
+  /module on|off NAME — включить/выключить модуль
+  /set KEY VALUE     — изменить параметр
+  /whitelist add|del ID — белый список
+  /stopword add|del WORD — стоп-слова
+  /pattern add|del REGEX — спам-паттерны
+  /strikes USER_ID   — посмотреть страйки""";
+}
+
+// ── Статистика ──
+on /antispam_status guard is_admin(ctx.user_id) {
+    let s = state.stats;
+    let modules_on = 0;
+    let modules_off = 0;
+    for k in keys(state.modules) {
+        if state.modules[k] { modules_on += 1; }
+        else { modules_off += 1; }
+    }
+    emit """📊 <b>Статистика AntiSpam</b>
+
+Сообщений проверено: {s["messages_scanned"]}
+Спам заблокирован: {s["spam_blocked"]}
+
+Предупреждений: {s["warns_issued"]}
+Мутов: {s["mutes_issued"]}
+Киков: {s["kicks_issued"]}
+Банов: {s["bans_issued"]}
+
+Captcha отправлено: {s["captchas_sent"]}
+Captcha пройдено: {s["captchas_passed"]}
+Рейдов обнаружено: {s["raids_detected"]}
+
+Модули: {modules_on} вкл / {modules_off} выкл
+Whitelist: {len(state.whitelist)} пользователей
+Стоп-слова: {len(state.stopwords)}
+Паттерны: {len(state.patterns)}""";
+}
+
+// ── Текущая конфигурация ──
+on /antispam_config guard is_admin(ctx.user_id) {
+    let lines = ["⚙️ <b>Конфигурация:</b>\n"];
+    for k in keys(state.config) {
+        push(lines, "  {k} = {state.config[k]}");
+    }
+    push(lines, "\n<b>Модули:</b>\n");
+    for k in keys(state.modules) {
+        let status = "✅";
+        if !state.modules[k] { status = "❌"; }
+        push(lines, "  {status} {k}");
+    }
+    emit join(lines, "\n");
+}
+
+// ── Лог действий ──
+on /antispam_log guard is_admin(ctx.user_id) {
+    let log = state.action_log;
+    if len(log) == 0 {
+        emit "📜 Лог пуст.";
+        return;
+    }
+    let lines = ["📜 <b>Последние действия:</b>\n"];
+    // Показываем последние 15
+    let start = 0;
+    if len(log) > 15 { start = len(log) - 15; }
+    let i = start;
+    while i < len(log) {
+        let e = log[i];
+        push(lines, "[{e[\"action\"]}] user={e[\"user_id\"]} room={e[\"room_id\"]} — {e[\"detail\"]}");
+        i += 1;
+    }
+    emit join(lines, "\n");
+}
+
+// ── Включить/выключить модуль ──
+on /module guard is_admin(ctx.user_id) {
+    let args = ctx.args;
+    if len(args) < 2 {
+        emit "Использование: /module on|off NAME\nМодули: flood, repeat, links, caps, patterns, stopwords, captcha, raid, night, length, emoji_spam, forwards";
+        return;
+    }
+    let action = args[0];
+    let name = args[1];
+    if !has(state.modules, name) {
+        emit "❌ Модуль «{name}» не найден.";
+        return;
+    }
+    if action == "on" {
+        state.modules[name] = true;
+        emit "✅ Модуль «{name}» включён.";
+    } elif action == "off" {
+        state.modules[name] = false;
+        emit "❌ Модуль «{name}» выключен.";
+    } else {
+        emit "Использование: /module on|off NAME";
+    }
+}
+
+// ── Изменить параметр ──
+on /set guard is_admin(ctx.user_id) {
+    let args = ctx.args;
+    if len(args) < 2 {
+        emit "Использование: /set PARAM VALUE\nПример: /set flood_limit 20";
+        return;
+    }
+    let key = args[0];
+    let val = int(args[1]);
+    if !has(state.config, key) {
+        emit "❌ Параметр «{key}» не найден.";
+        return;
+    }
+    state.config[key] = val;
+    emit "✅ {key} = {val}";
+}
+
+// ── Whitelist ──
+on /whitelist guard is_admin(ctx.user_id) {
+    let args = ctx.args;
+    if len(args) < 2 {
+        emit "Использование: /whitelist add|del USER_ID";
+        return;
+    }
+    let action = args[0];
+    let uid = int(args[1]);
+    if action == "add" {
+        state.whitelist[uid] = ts();
+        emit "✅ Пользователь {uid} добавлен в whitelist.";
+    } elif action == "del" {
+        del(state.whitelist, str(uid));
+        emit "✅ Пользователь {uid} удалён из whitelist.";
+    }
+}
+
+// ── Стоп-слова ──
+on /stopword guard is_admin(ctx.user_id) {
+    let args = ctx.args;
+    if len(args) < 2 {
+        emit "Использование: /stopword add|del СЛОВО\nТекущие: {join(state.stopwords, \", \")}";
+        return;
+    }
+    let action = args[0];
+    // Собираем слово из остальных аргументов
+    let word_parts = [];
+    let i = 1;
+    while i < len(args) {
+        push(word_parts, args[i]);
+        i += 1;
+    }
+    let word = join(word_parts, " ");
+
+    if action == "add" {
+        push(state.stopwords, word);
+        emit "✅ Стоп-слово добавлено: «{word}»";
+    } elif action == "del" {
+        let new_list = [];
+        for w in state.stopwords {
+            if lowercase(w) != lowercase(word) {
+                push(new_list, w);
+            }
+        }
+        state.stopwords = new_list;
+        emit "✅ Стоп-слово удалено: «{word}»";
+    }
+}
+
+// ── Паттерны ──
+on /pattern guard is_admin(ctx.user_id) {
+    let args = ctx.args;
+    if len(args) < 2 {
+        emit "Использование: /pattern add|del REGEX\nТекущие ({len(state.patterns)}):\n{join(state.patterns, \"\n\")}";
+        return;
+    }
+    let action = args[0];
+    let pat_parts = [];
+    let i = 1;
+    while i < len(args) {
+        push(pat_parts, args[i]);
+        i += 1;
+    }
+    let pat = join(pat_parts, " ");
+
+    if action == "add" {
+        push(state.patterns, pat);
+        emit "✅ Паттерн добавлен: {pat}";
+    } elif action == "del" {
+        let new_list = [];
+        for p in state.patterns {
+            if p != pat { push(new_list, p); }
+        }
+        state.patterns = new_list;
+        emit "✅ Паттерн удалён: {pat}";
+    }
+}
+
+// ── Просмотр страйков пользователя ──
+on /strikes guard is_admin(ctx.user_id) {
+    let args = ctx.args;
+    if len(args) < 1 {
+        emit "Использование: /strikes USER_ID";
+        return;
+    }
+    let uid = int(args[0]);
+    let s = get_strikes(uid);
+    emit """📋 Страйки для user {uid}:
+  Предупреждения: {s["warns"]}
+  Муты: {s["mutes"]}
+  Кики: {s["kicks"]}
+  Последнее действие: {s["last_ts"]}""";
+}
+
+// ── Сброс страйков ──
+on /antispam_reset guard is_admin(ctx.user_id) {
+    let args = ctx.args;
+    if len(args) < 1 {
+        emit "Использование: /antispam_reset USER_ID";
+        return;
+    }
+    let uid = int(args[0]);
+    state.user_strikes[uid] = { "warns": 0, "mutes": 0, "kicks": 0, "last_ts": 0 };
+    emit "✅ Страйки для user {uid} сброшены.";
+}
+
+// ── Не-админ пробует команду ──
+on /antispam {
+    emit "⛔️ Только для администраторов.";
+}
+
+// ── Справка для обычных пользователей ──
+on /antispam_help {
+    emit """🛡 <b>AntiSpam Bot</b>
+
+Этот бот автоматически защищает чат от:
+• Флуда (много сообщений подряд)
+• Повторяющихся сообщений
+• Спам-ссылок и URL-сокращателей
+• Сообщений КАПСОМ
+• Спам-контента (казино, крипто-скам и т.д.)
+
+Новые участники проходят captcha-верификацию.
+При нарушениях: предупреждение → мут → кик → бан.
+
+Вопросы? Обратитесь к администраторам чата.""";
+}

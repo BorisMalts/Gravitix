@@ -1,0 +1,112 @@
+// ════════════════════════════════════════════════════════════════
+//  hello_bot.grav — Простой пример Gravitix-бота
+//  Запуск: gravitix run hello_bot.grav --token YOUR_TOKEN
+// ════════════════════════════════════════════════════════════════
+
+// ── Постоянное состояние бота ────────────────────────────────────
+state {
+    greet_count: int = 0,
+    users: map<int, str> = {},
+    admins_notified: int = 0,
+}
+
+// ── /start ───────────────────────────────────────────────────────
+on /start {
+    state.greet_count += 1;
+    emit "Привет, {ctx.first_name}! 👋";
+    emit "Ты запускаешь этого бота в {state.greet_count}-й раз.";
+    emit "Используй /help чтобы увидеть команды.";
+}
+
+// ── /help ────────────────────────────────────────────────────────
+on /help {
+    emit """Доступные команды:
+/start        — приветствие
+/help         — эта справка
+/register     — регистрация в боте
+/count        — сколько пользователей зарегистрировано
+/calc 2 + 2   — простой калькулятор
+/ping         — проверить доступность""";
+}
+
+// ── /ping ────────────────────────────────────────────────────────
+on /ping {
+    emit "pong 🏓";
+}
+
+// ── /count ───────────────────────────────────────────────────────
+on /count {
+    let n = state.users.len();
+    if n == 0 {
+        emit "Пока никто не зарегистрирован.";
+    } else {
+        emit "Зарегистрировано пользователей: {n}";
+    }
+}
+
+// ── /register  (многошаговый диалог через flow) ──────────────────
+on /register {
+    if state.users.has(ctx.user_id) {
+        emit "Ты уже зарегистрирован как {state.users[ctx.user_id]} ✅";
+        return;
+    }
+    run flow register;
+}
+
+flow register {
+    emit "Введи своё имя:";
+    let name = wait msg;
+
+    let name = name |> trim;
+    if len(name) < 2 {
+        emit "Слишком короткое имя. Попробуй снова /register";
+        return;
+    }
+
+    emit "Привет, {name}! Сколько тебе лет?";
+    let age_str = wait msg;
+    let age = int(age_str);
+
+    if age < 5 || age > 120 {
+        emit "Похоже, возраст указан неверно 🤔 Попробуй /register снова.";
+        return;
+    }
+
+    state.users[ctx.user_id] = name;
+    emit "Отлично! Ты зарегистрирован, {name} ({age} лет) 🎉";
+}
+
+// ── /admin ───────────────────────────────────────────────────────
+on /admin guard ctx.is_admin {
+    let users_count = state.users.len();
+    let greets      = state.greet_count;
+    emit """👑 Панель администратора:
+• Пользователей: {users_count}
+• Приветствий: {greets}
+• Твой ID: {ctx.user_id}""";
+}
+
+on /admin {
+    emit "⛔️ Только для администраторов.";
+}
+
+// ── Паттерн-матчинг текста ────────────────────────────────────────
+on msg {
+    match ctx.text {
+        /привет|hello|hi|хай/i  => emit "Привет! 😊 Я тут. Попробуй /help",
+        /пока|bye|goodbye/i      => emit "До свидания! 👋",
+        "ping"                   => emit "pong",
+        /^\/calc (.+)/           => {
+            emit "Калькулятор пока в разработке 🛠";
+        },
+        _ => {}
+    }
+}
+
+// ── Ежедневный дайджест ───────────────────────────────────────────
+every 24 hours {
+    let count = state.users.len();
+    if count > 0 {
+        emit "🌅 Доброе утро! Зарегистрировано пользователей: {count}";
+    }
+}
